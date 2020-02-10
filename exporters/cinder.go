@@ -1,14 +1,18 @@
 package exporters
 
 import (
+	"errors"
 	"strconv"
 	"strings"
 
 	"github.com/gophercloud/gophercloud"
+	"github.com/gophercloud/gophercloud/openstack"
+	"github.com/gophercloud/gophercloud/openstack/blockstorage/extensions/quotasets"
 	"github.com/gophercloud/gophercloud/openstack/blockstorage/extensions/services"
 	"github.com/gophercloud/gophercloud/openstack/blockstorage/extensions/volumetenants"
 	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/snapshots"
 	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/volumes"
+	"github.com/gophercloud/gophercloud/openstack/identity/v3/projects"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -53,6 +57,8 @@ var defaultCinderMetrics = []Metric{
 	{Name: "snapshots", Fn: ListSnapshots},
 	{Name: "agent_state", Labels: []string{"hostname", "service", "adminState", "zone"}, Fn: ListCinderAgentState},
 	{Name: "volume_status", Labels: []string{"id", "name", "status", "bootable", "tenant_id", "size", "volume_type"}, Fn: nil},
+	{Name: "limits_max", Labels: []string{"tenant"}, Fn: ListCinderLimits},
+	{Name: "limits_used", Labels: []string{"tenant"}},
 }
 
 func NewCinderExporter(client *gophercloud.ServiceClient, prefix string, disabledMetrics []string) (*CinderExporter, error) {
@@ -145,4 +151,60 @@ func ListCinderAgentState(exporter *BaseOpenStackExporter, ch chan<- prometheus.
 	}
 
 	return nil
+}
+
+func ListCinderLimits(exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
+
+	var allProjects []projects.Project
+	var eo gophercloud.EndpointOpts
+
+	// We need a list of all tenants/projects.
+	// Therefore, within this nova exporter we need
+	// to create an openstack client for the Identity/Keystone API.
+	// If possible, use the EndpointOpts spefic to the identity service.
+	if v, ok := endpointOpts["identity"]; ok {
+		eo = v
+	} else if v, ok := endpointOpts["cinder"]; ok {
+		eo = v
+	} else {
+		return errors.New("No EndpointOpts available to create Identity client")
+	}
+
+	c, err := openstack.NewIdentityV3(exporter.Client.ProviderClient, eo)
+	if err != nil {
+		return err
+	}
+
+	allPagesProject, err := projects.List(c, projects.ListOpts{}).AllPages()
+	if err != nil {
+		return err
+	}
+
+	allProjects, err = projects.ExtractProjects(allPagesProject)
+	if err != nil {
+		return err
+	}
+
+	for _, p := range allProjects {
+
+		limits, err := quotasets.Get(exporter.Client, p.ID).Extract()
+		if err != nil {
+			return err
+		}
+
+		limitsUsed, err := quotasets.GetUsage(exporter.Client, p.ID).Extract()
+		if err != nil {
+			return err
+		}
+
+		ch <- prometheus.MustNewConstMetric(exporter.Metrics["limits_max"].Metric,
+			prometheus.GaugeValue, float64(limits.Gigabytes), p.Name)
+
+		ch <- prometheus.MustNewConstMetric(exporter.Metrics["limits_used"].Metric,
+			prometheus.GaugeValue, float64(limitsUsed.Gigabytes.InUse), p.Name)
+
+	}
+
+	return nil
+
 }
